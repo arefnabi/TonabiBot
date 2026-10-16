@@ -1,174 +1,188 @@
-import asyncio
-import logging
+"""Simple Telegram shop-support bot using only Python's standard library."""
+
+import json
+import os
 import re
-import sys
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-# --- تنظیمات ربات ---
-BOT_TOKEN = "8687413770"
-ADMIN_GROUP_ID = -1004411883938
-PORT = 10000
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+DB_PATH = os.environ.get("BOT_DB_PATH", "support_bot.sqlite3")
+API = f"https://api.telegram.org/bot{TOKEN}/"
+MENU = "لطفاً نوع درخواست خود را انتخاب کنید:"
+CATEGORIES = {
+    "complaint": "ثبت شکایت",
+    "criticism": "انتقاد",
+    "suggestion": "پیشنهاد",
+    "expert": "ارتباط با کارشناس",
+}
 
-# وضعیت‌های کاربر (FSM)
-class SupportStates(StatesGroup):
-    waiting_for_feedback = State()
-    waiting_for_complaint = State()
 
-# کیبورد اصلی
-def main_menu():
-    return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="💬 ارتباط با پشتیبانی"), types.KeyboardButton(text="✍️ ثبت نظر و پیشنهاد")],
-            [types.KeyboardButton(text="⚠️ ثبت شکایت"), types.KeyboardButton(text="ℹ️ درباره ما")],
-        ],
-        resize_keyboard=True
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, phone TEXT, step TEXT NOT NULL DEFAULT 'first_name', category TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS replies (admin_message_id INTEGER PRIMARY KEY, user_chat_id INTEGER NOT NULL)")
+
+
+def api(method, data):
+    request = urllib.request.Request(
+        API + method,
+        data=urllib.parse.urlencode(data).encode("utf-8"),
     )
+    with urllib.request.urlopen(request, timeout=40) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Telegram API error"))
+    return result["result"]
 
-def cancel_menu():
-    return types.ReplyKeyboardMarkup(
-        keyboard=[[types.KeyboardButton(text="❌ انصراف")]],
-        resize_keyboard=True
-    )
 
-# وب‌سرور سبک برای باز نگه داشتن پورت در رندر
-async def handle_ping(request):
-    return web.Response(text="TonabiBot is running successfully!")
+def send(chat_id, text, keyboard=None, reply_to=None):
+    data = {"chat_id": chat_id, "text": text}
+    if keyboard:
+        data["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+    return api("sendMessage", data)
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logging.info(f"Web server started on port {PORT}")
 
-async def main():
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
-    )
-    dp = Dispatcher(storage=MemoryStorage())
+def category_keyboard():
+    return {"keyboard": [[{"text": title}] for title in CATEGORIES.values()], "resize_keyboard": True}
 
-    # شروع ربات یا انصراف
-    @dp.message(F.text.in_(["/start", "❌ انصراف"]))
-    async def start_handler(message: types.Message, state: FSMContext):
-        await state.clear()
-        await message.answer(
-            "سلام! به بخش پشتیبانی فروشگاه عطر **تونابی** خوش آمدید. 🌹\n\n"
-            "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
-            reply_markup=main_menu()
-        )
 
-    # درباره ما
-    @dp.message(F.text == "ℹ️ درباره ما")
-    async def about_us(message: types.Message):
-        await message.answer(
-            "🌸 **فروشگاه عطر و ادکلن تونابی**\n\n"
-            "ارائه‌دهنده بهترین و باکیفیت‌ترین عطرهای روز دنیا با مناسب‌ترین قیمت.\n"
-            "همیشه در کنار شما هستیم تا بهترین رایحه را انتخاب کنید.",
-            reply_markup=main_menu()
-        )
+def save_user(chat_id, **values):
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with db() as conn:
+        conn.execute(f"UPDATE users SET {assignments} WHERE chat_id = ?", (*values.values(), chat_id))
 
-    # درخواست ارتباط با پشتیبانی
-    @dp.message(F.text == "💬 ارتباط با پشتیبانی")
-    async def support_request(message: types.Message, state: FSMContext):
-        await state.set_state(SupportStates.waiting_for_feedback)
-        await message.answer(
-            "لطفاً پیام یا سوال خود را ارسال کنید تا برای تیم پشتیبانی ارسال شود:",
-            reply_markup=cancel_menu()
-        )
 
-    # ثبت نظر و پیشنهاد
-    @dp.message(F.text == "✍️ ثبت نظر و پیشنهاد")
-    async def feedback_request(message: types.Message, state: FSMContext):
-        await state.set_state(SupportStates.waiting_for_feedback)
-        await message.answer(
-            "نظر، پیشنهاد یا انتقاد خود را برای ما بنویسید:",
-            reply_markup=cancel_menu()
-        )
+def get_user(chat_id):
+    with db() as conn:
+        return conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
 
-    # ثبت شکایت
-    @dp.message(F.text == "⚠️ ثبت شکایت")
-    async def complaint_request(message: types.Message, state: FSMContext):
-        await state.set_state(SupportStates.waiting_for_complaint)
-        await message.answer(
-            "لطفاً متن شکایت خود را به همراه اطلاعات لازم ارسال فرمایید:",
-            reply_markup=cancel_menu()
-        )
 
-    # دریافت پیام‌های مرحله‌ای (پشتیبانی/شکایت) و ارسال به گروه
-    @dp.message(SupportStates.waiting_for_feedback)
-    @dp.message(SupportStates.waiting_for_complaint)
-    async def forward_feedback_to_admin(message: types.Message, state: FSMContext):
-        current_state = await state.get_state()
-        title = "⚠️ [شکایت جدید]" if current_state == SupportStates.waiting_for_complaint.state else "💬 [پیام پشتیبانی / نظر]"
-        
-        user = message.from_user
-        username = f"@{user.username}" if user.username else "ندارد"
-        text_content = message.text or message.caption or "(بدون متن)"
+def start(chat_id):
+    with db() as conn:
+        conn.execute("INSERT INTO users(chat_id, step) VALUES(?, 'first_name') ON CONFLICT(chat_id) DO UPDATE SET step='first_name', category=NULL", (chat_id,))
+    send(chat_id, "سلام! به پشتیبانی فروشگاه خوش آمدید.\nلطفاً نام خود را وارد کنید:")
 
-        caption = (
-            f"{title}\n\n"
-            f"👤 نام: {user.full_name}\n"
-            f"🔗 یوزرنیم: {username}\n"
-            f"🆔 آیدی عددی: `{user.id}`\n\n"
-            f"📝 متن پیام:\n{text_content}"
-        )
 
-        await bot.send_message(ADMIN_GROUP_ID, caption)
-        await state.clear()
-        await message.answer("✅ پیام شما با موفقیت برای پشتیبانی تونابی ارسال شد.", reply_markup=main_menu())
+def process_message(message):
+    chat_id = message["chat"]["id"]
+    text = (message.get("text") or "").strip()
+    contact = message.get("contact")
 
-    # دریافت هر پیام متنی عادی دیگر از چت خصوصی و ارسال به گروه
-    @dp.message(F.chat.type == "private")
-    async def fallback_user_message(message: types.Message):
-        user = message.from_user
-        username = f"@{user.username}" if user.username else "ندارد"
-        text_content = message.text or message.caption or "(بدون متن)"
-
-        caption = (
-            f"📩 [پیام کاربر]\n\n"
-            f"👤 نام: {user.full_name}\n"
-            f"🔗 یوزرنیم: {username}\n"
-            f"🆔 آیدی عددی: `{user.id}`\n\n"
-            f"📝 متن پیام:\n{text_content}"
-        )
-        await bot.send_message(ADMIN_GROUP_ID, caption)
-        await message.answer("✅ پیام شما دریافت شد و به پشتیبانی منتقل گردید.", reply_markup=main_menu())
-
-    # پاسخ ادمین با Reply در گروه تلگرام
-    @dp.message(F.chat.id == ADMIN_GROUP_ID, F.reply_to_message)
-    async def admin_reply_handler(message: types.Message):
-        replied = message.reply_to_message
-        if not replied or not (replied.text or replied.caption):
+    # A reply to a forwarded ticket from the configured admin is relayed to its owner.
+    if str(chat_id) == ADMIN_CHAT_ID and message.get("reply_to_message"):
+        replied_id = message["reply_to_message"]["message_id"]
+        with db() as conn:
+            row = conn.execute("SELECT user_chat_id FROM replies WHERE admin_message_id=?", (replied_id,)).fetchone()
+        if row:
+            try:
+                api("copyMessage", {"chat_id": row["user_chat_id"], "from_chat_id": chat_id, "message_id": message["message_id"]})
+                send(chat_id, "پاسخ شما برای کاربر ارسال شد.")
+            except Exception as exc:
+                print("Reply delivery failed:", exc)
+                send(chat_id, "ارسال پاسخ انجام نشد؛ لطفاً دوباره تلاش کنید.")
             return
 
-        source_text = replied.text or replied.caption
-        match = re.search(r"🆔 آیدی عددی:\s*`(\d+)`", source_text)
-        if match:
-            target_id = int(match.group(1))
-            try:
-                reply_text = message.text or message.caption or "پاسخ ارسال شد."
-                await bot.send_message(
-                    target_id,
-                    f"💬 **پاسخ پشتیبانی تونابی:**\n\n{reply_text}"
-                )
-                await message.reply("✅ پاسخ برای کاربر ارسال گردید.")
-            except Exception as e:
-                await message.reply(f"❌ خطا در ارسال پاسخ به کاربر: {e}")
+    if text == "/start":
+        start(chat_id)
+        return
 
-    # استارت همزمان وب‌سرور و دریافت پیام‌ها
-    await start_web_server()
-    await dp.start_polling(bot)
+    user = get_user(chat_id)
+    if not user:
+        start(chat_id)
+        return
+
+    step = user["step"]
+    if step == "first_name":
+        if not text or len(text) > 80:
+            send(chat_id, "لطفاً نام معتبر وارد کنید:")
+            return
+        save_user(chat_id, first_name=text, step="last_name")
+        send(chat_id, "ممنون. حالا نام خانوادگی خود را وارد کنید:")
+    elif step == "last_name":
+        if not text or len(text) > 100:
+            send(chat_id, "لطفاً نام خانوادگی معتبر وارد کنید:")
+            return
+        save_user(chat_id, last_name=text, step="phone")
+        send(chat_id, "شماره تلفن را بنویسید یا از دکمهٔ زیر برای فرستادن شمارهٔ تلگرام خود استفاده کنید:", {
+            "keyboard": [[{"text": "ارسال شماره تلفن", "request_contact": True}]],
+            "resize_keyboard": True, "one_time_keyboard": True,
+        })
+    elif step == "phone":
+        phone = contact.get("phone_number", "") if contact and contact.get("user_id", chat_id) == chat_id else text
+        normalized = re.sub(r"[\s()+.-]", "", phone)
+        if not re.fullmatch(r"\+?\d{7,15}", normalized):
+            send(chat_id, "شماره معتبر نیست. دوباره وارد کنید یا از دکمهٔ ارسال شماره تلفن استفاده کنید:")
+            return
+        save_user(chat_id, phone=phone, step="category")
+        send(chat_id, MENU, category_keyboard())
+    elif step in ("category", "conversation"):
+        selected = next((key for key, title in CATEGORIES.items() if text == title), None)
+        if step == "category" and selected:
+            save_user(chat_id, category=selected, step="conversation")
+            if selected == "expert":
+                send(chat_id, "پیام خود را بنویسید؛ آن را برای کارشناس می‌فرستم. پاسخ کارشناس همین‌جا برایتان ارسال می‌شود.")
+            else:
+                send(chat_id, f"لطفاً جزئیات «{CATEGORIES[selected]}» را در یک پیام بنویسید:")
+            return
+        if not text and not message.get("photo") and not message.get("document") and not message.get("voice"):
+            send(chat_id, "لطفاً پیام متنی یا فایل خود را بفرستید.")
+            return
+        category = user["category"] or "expert"
+        label = CATEGORIES.get(category, "ارتباط با کارشناس")
+        summary = (f"درخواست جدید: {label}\n"
+                   f"نام: {user['first_name']} {user['last_name']}\n"
+                   f"تلفن: {user['phone']}\n"
+                   f"شناسه کاربر: {chat_id}\n\n"
+                   "برای پاسخ به کاربر، روی این پیام در چت مدیر Reply کنید.")
+        try:
+            forwarded = send(int(ADMIN_CHAT_ID), summary)
+            copied = api("copyMessage", {"chat_id": int(ADMIN_CHAT_ID), "from_chat_id": chat_id, "message_id": message["message_id"]})
+            with db() as conn:
+                conn.execute("INSERT OR REPLACE INTO replies(admin_message_id, user_chat_id) VALUES(?, ?)", (forwarded["message_id"], chat_id))
+                conn.execute("INSERT OR REPLACE INTO replies(admin_message_id, user_chat_id) VALUES(?, ?)", (copied["message_id"], chat_id))
+            send(chat_id, "پیام شما ثبت شد و برای پشتیبانی ارسال شد. اگر نیاز به ادامهٔ گفتگو دارید، پیام بعدی را همین‌جا بفرستید.", category_keyboard())
+        except Exception as exc:
+            print("Ticket delivery failed:", exc)
+            send(chat_id, "ارسال پیام انجام نشد. کمی بعد دوباره تلاش کنید یا /start را بزنید.")
+
+
+def main():
+    if not TOKEN or not ADMIN_CHAT_ID:
+        raise SystemExit("لطفاً TELEGRAM_BOT_TOKEN و ADMIN_CHAT_ID را در متغیرهای محیطی تنظیم کنید.")
+    init_db()
+    try:
+        offset = int(api("getUpdates", {"timeout": 0, "allowed_updates": json.dumps(["message"])}))
+    except Exception:
+        offset = 0
+    print("Support bot is running.")
+    while True:
+        try:
+            updates = api("getUpdates", {"offset": offset, "timeout": 30, "allowed_updates": json.dumps(["message"])})
+            for update in updates:
+                offset = update["update_id"] + 1
+                if "message" in update:
+                    process_message(update["message"])
+        except (urllib.error.URLError, TimeoutError) as exc:
+            print("Connection error:", exc)
+            time.sleep(3)
+        except Exception as exc:
+            print("Update error:", exc)
+            time.sleep(2)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
